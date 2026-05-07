@@ -48,11 +48,11 @@ def test_make_headers_includes_route_tag_when_configured() -> None:
     assert headers["Authorization"] == "Bearer token"
     assert headers["SKRouteTag"] == "123"
     assert headers["iLink-App-Id"] == "bot"
-    assert headers["iLink-App-ClientVersion"] == str((2 << 16) | (1 << 8) | 1)
+    assert headers["iLink-App-ClientVersion"] == str((2 << 16) | (1 << 8) | 7)
 
 
 def test_channel_version_matches_reference_plugin_version() -> None:
-    assert WEIXIN_CHANNEL_VERSION == "2.1.1"
+    assert WEIXIN_CHANNEL_VERSION == "2.1.7"
 
 
 def test_save_and_load_state_persists_context_tokens(tmp_path) -> None:
@@ -1362,3 +1362,71 @@ async def test_poll_loop_logs_exception_and_continues_on_poll_failure(monkeypatc
 
     assert call_count == 2
     assert any("WeChat poll loop error" in m for m in logged_messages)
+
+
+@pytest.mark.asyncio
+async def test_send_text_retries_without_context_token_on_ret_minus_two() -> None:
+    """If sendmessage returns ret=-2 with a context_token, retry without it."""
+    channel, _bus = _make_channel()
+    channel._client = object()
+    channel._token = "token"
+    channel._context_tokens["wx-user"] = "expired-token"
+
+    channel._api_post = AsyncMock(
+        side_effect=[
+            {"ret": -2},  # first attempt with token fails
+            {"ret": 0},   # retry without token succeeds
+        ]
+    )
+
+    await channel._send_text("wx-user", "hello", "expired-token")
+
+    # Should have called API twice
+    assert channel._api_post.await_count == 2
+    # First call includes context_token
+    first_body = channel._api_post.await_args_list[0].args[1]
+    assert first_body["msg"]["context_token"] == "expired-token"
+    # Second call does NOT include context_token
+    second_body = channel._api_post.await_args_list[1].args[1]
+    assert "context_token" not in second_body["msg"]
+    # Expired token should be cleared from cache
+    assert "wx-user" not in channel._context_tokens
+
+
+@pytest.mark.asyncio
+async def test_send_text_raises_when_ret_minus_two_retry_also_fails() -> None:
+    """If both attempts (with and without token) return ret=-2, raise."""
+    channel, _bus = _make_channel()
+    channel._client = object()
+    channel._token = "token"
+    channel._context_tokens["wx-user"] = "bad-token"
+
+    channel._api_post = AsyncMock(
+        side_effect=[
+            {"ret": -2},  # with token
+            {"ret": -2},  # without token
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="ret=-2"):
+        await channel._send_text("wx-user", "hello", "bad-token")
+
+    assert channel._api_post.await_count == 2
+    # Token is NOT cleared because retry also failed
+    assert channel._context_tokens.get("wx-user") == "bad-token"
+
+
+@pytest.mark.asyncio
+async def test_send_text_does_not_retry_without_token_when_no_context_token() -> None:
+    """If no context_token was provided, ret=-2 should raise immediately."""
+    channel, _bus = _make_channel()
+    channel._client = object()
+    channel._token = "token"
+
+    channel._api_post = AsyncMock(return_value={"ret": -2})
+
+    with pytest.raises(RuntimeError, match="ret=-2"):
+        await channel._send_text("wx-user", "hello", "")
+
+    # Only one API call (no retry)
+    channel._api_post.assert_awaited_once()

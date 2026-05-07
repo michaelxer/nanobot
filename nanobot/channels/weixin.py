@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -54,7 +55,7 @@ MESSAGE_TYPE_BOT = 2
 MESSAGE_STATE_FINISH = 2
 
 WEIXIN_MAX_MESSAGE_LEN = 4000
-WEIXIN_CHANNEL_VERSION = "2.1.1"
+WEIXIN_CHANNEL_VERSION = "2.1.7"
 ILINK_APP_ID = "bot"
 
 
@@ -526,8 +527,7 @@ class WeixinChannel(BaseChannel):
                 f"WeChat session paused, {remaining_min} min remaining (errcode {ERRCODE_SESSION_EXPIRED})"
             )
 
-    @staticmethod
-    def _check_response_error(data: dict, operation: str) -> None:
+    def _check_response_error(self, data: dict, operation: str, *, body: dict | None = None) -> None:
         """Check both ``ret`` and ``errcode`` like the reference TS code.
 
         The iLink API may signal failure through either field (or both).
@@ -537,10 +537,11 @@ class WeixinChannel(BaseChannel):
         ret = data.get("ret", 0)
         errcode = data.get("errcode", 0)
         is_error = (ret is not None and ret != 0) or (errcode is not None and errcode != 0)
-        if is_error:
-            raise RuntimeError(
-                f"WeChat {operation} error (ret={ret}, errcode={errcode}): {data.get('errmsg', '')}"
-            )
+        if not is_error:
+            return
+        raise RuntimeError(
+            f"WeChat {operation} error (ret={ret}, errcode={errcode}): {data.get('errmsg', '')}"
+        )
 
     async def _poll_once(self) -> None:
         remaining = self._session_pause_remaining_s()
@@ -1139,7 +1140,37 @@ class WeixinChannel(BaseChannel):
         }
 
         data = await self._api_post("ilink/bot/sendmessage", body)
-        self._check_response_error(data, "send text")
+        ret = data.get("ret", 0)
+        errcode = data.get("errcode", 0)
+
+        # If ret=-2 (parameter error / rate limit / expired token) and we sent
+        # with a context_token, retry once without it.  The openclaw reference
+        # plugin can send without a token (it just warns), and issue #61174
+        # shows that expired context_tokens are a common cause of ret=-2.
+        if ret == -2 and context_token:
+            self.logger.warning(
+                "WeChat send text returned ret=-2 for {} (client_id={}); "
+                "retrying without context_token",
+                to_user_id,
+                client_id,
+            )
+            body_no_ctx = copy.deepcopy(body)
+            body_no_ctx["msg"].pop("context_token", None)
+            data = await self._api_post("ilink/bot/sendmessage", body_no_ctx)
+            ret = data.get("ret", 0)
+            errcode = data.get("errcode", 0)
+            if ret == 0 and (errcode == 0 or errcode is None):
+                self.logger.warning(
+                    "WeChat send text succeeded WITHOUT context_token for {}; "
+                    "clearing expired token from cache",
+                    to_user_id,
+                )
+                self._context_tokens.pop(to_user_id, None)
+                self._save_state()
+                self.logger.debug("WeChat text sent to {} (client_id={})", to_user_id, client_id)
+                return
+
+        self._check_response_error(data, "send text", body=body)
         self.logger.debug("WeChat text sent to {} (client_id={})", to_user_id, client_id)
 
     async def _send_media_file(
@@ -1286,7 +1317,7 @@ class WeixinChannel(BaseChannel):
         }
 
         data = await self._api_post("ilink/bot/sendmessage", body)
-        self._check_response_error(data, "send media")
+        self._check_response_error(data, "send media", body=body)
 
 
 # ---------------------------------------------------------------------------
