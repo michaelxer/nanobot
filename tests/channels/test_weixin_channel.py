@@ -1394,8 +1394,8 @@ async def test_send_text_retries_without_context_token_on_ret_minus_two() -> Non
 
 
 @pytest.mark.asyncio
-async def test_send_text_swallows_ret_minus_two_when_retry_also_fails() -> None:
-    """If both attempts return ret=-2, swallow the error (matching openclaw)."""
+async def test_send_text_raises_when_retry_also_fails_with_stale_session() -> None:
+    """If both attempts return stale-session ret=-2, raise so ChannelManager retries."""
     channel, _bus = _make_channel()
     channel._client = object()
     channel._token = "token"
@@ -1408,8 +1408,8 @@ async def test_send_text_swallows_ret_minus_two_when_retry_also_fails() -> None:
         ]
     )
 
-    # Should NOT raise
-    await channel._send_text("wx-user", "hello", "bad-token")
+    with pytest.raises(RuntimeError, match="WeChat send text error"):
+        await channel._send_text("wx-user", "hello", "bad-token")
 
     assert channel._api_post.await_count == 2
     # Token is NOT cleared because retry also failed
@@ -1417,16 +1417,55 @@ async def test_send_text_swallows_ret_minus_two_when_retry_also_fails() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_text_swallows_ret_minus_two_when_no_context_token() -> None:
-    """If no context_token was provided, ret=-2 is swallowed without retry."""
+async def test_send_text_raises_on_ret_minus_two_when_no_context_token() -> None:
+    """If no context_token was provided, ret=-2 stale session is raised."""
     channel, _bus = _make_channel()
     channel._client = object()
     channel._token = "token"
 
     channel._api_post = AsyncMock(return_value={"ret": -2})
 
-    # Should NOT raise
-    await channel._send_text("wx-user", "hello", "")
+    with pytest.raises(RuntimeError, match="WeChat send text error"):
+        await channel._send_text("wx-user", "hello", "")
 
-    # Only one API call (no retry)
+    # Only one API call (no retry possible without token)
     channel._api_post.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Tests for _is_stale_session_ret (hermes-agent#17228 / #18105)
+# ---------------------------------------------------------------------------
+
+
+class TestIsStaleSessionRet:
+    """Verify stale-session detection for iLink ret=-2 / errcode=-2 responses."""
+
+    def test_ret_minus_2_with_empty_errmsg_is_stale(self):
+        assert weixin_mod._is_stale_session_ret(-2, 0, "") is True
+        assert weixin_mod._is_stale_session_ret(-2, 0, None) is True
+
+    def test_errcode_minus_2_with_empty_errmsg_is_stale(self):
+        assert weixin_mod._is_stale_session_ret(0, -2, "") is True
+        assert weixin_mod._is_stale_session_ret(0, -2, None) is True
+
+    def test_ret_minus_2_with_unknown_error_is_stale(self):
+        assert weixin_mod._is_stale_session_ret(-2, 0, "unknown error") is True
+        assert weixin_mod._is_stale_session_ret(-2, 0, "UNKNOWN ERROR") is True
+
+    def test_errcode_minus_2_with_unknown_error_is_stale(self):
+        assert weixin_mod._is_stale_session_ret(0, -2, "unknown error") is True
+
+    def test_ret_minus_2_with_frequency_limit_is_not_stale(self):
+        assert weixin_mod._is_stale_session_ret(-2, 0, "frequency limit") is False
+        assert weixin_mod._is_stale_session_ret(-2, 0, "too frequently") is False
+
+    def test_errcode_minus_2_with_frequency_limit_is_not_stale(self):
+        assert weixin_mod._is_stale_session_ret(0, -2, "freq limit") is False
+
+    def test_success_codes_are_not_stale(self):
+        assert weixin_mod._is_stale_session_ret(0, 0, "") is False
+        assert weixin_mod._is_stale_session_ret(0, 0, None) is False
+
+    def test_other_errors_are_not_stale(self):
+        assert weixin_mod._is_stale_session_ret(-14, -14, "session timeout") is False
+        assert weixin_mod._is_stale_session_ret(-100, 0, "internal error") is False

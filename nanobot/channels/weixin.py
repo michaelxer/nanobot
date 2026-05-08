@@ -80,6 +80,36 @@ BASE_INFO: dict[str, str] = {"channel_version": WEIXIN_CHANNEL_VERSION}
 ERRCODE_SESSION_EXPIRED = -14
 SESSION_PAUSE_DURATION_S = 60 * 60
 
+# iLink rate-limit / stale-session errcode
+RATE_LIMIT_ERRCODE = -2
+
+
+def _is_stale_session_ret(
+    ret: int | None,
+    errcode: int | None,
+    errmsg: str | None,
+) -> bool:
+    """True when iLink returns ret=-2 / errcode=-2 that is likely a stale
+    context_token rather than a genuine rate limit.
+
+    Empirically iLink signals these two scenarios weakly:
+    - stale session:      ret=-2, errmsg="unknown error" OR errmsg empty/None
+    - genuine rate limit: ret=-2 with a populated errmsg such as
+      "frequency limit" / "too frequently" / similar
+
+    Treating "unknown error" and empty/None errmsg as stale-session signals
+    lets the caller attempt one tokenless retry. A true rate limit still
+    falls through to the existing retry/backoff path if the tokenless
+    attempt also fails.
+    """
+    if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
+        return False
+    msg = (errmsg or "").strip().lower()
+    if not msg:
+        return True
+    return msg == "unknown error"
+
+
 # Retry constants (matching the reference plugin's monitor.ts)
 MAX_CONSECUTIVE_FAILURES = 3
 BACKOFF_DELAY_S = 30
@@ -1149,49 +1179,42 @@ class WeixinChannel(BaseChannel):
         data = await self._api_post("ilink/bot/sendmessage", body)
         ret = data.get("ret", 0)
         errcode = data.get("errcode", 0)
+        errmsg = data.get("errmsg", "")
 
-        # The iLink sendmessage API frequently returns ret=-2 (parameter
-        # error / rate limit / expired token) even though HTTP status is 200.
-        # The openclaw reference plugin ignores the JSON body for sendmessage
-        # and only checks HTTP status.  We retry once without context_token
-        # (a common fix for token expiry per openclaw#61174), but if that
-        # also fails we swallow ret=-2 to avoid silent message drops.
-        if ret == -2:
-            if context_token:
-                self.logger.warning(
-                    "WeChat send text returned ret=-2 for {} (client_id={}); "
-                    "retrying without context_token",
-                    to_user_id,
-                    client_id,
-                )
-                body_no_ctx = copy.deepcopy(body)
-                body_no_ctx["msg"].pop("context_token", None)
-                data = await self._api_post("ilink/bot/sendmessage", body_no_ctx)
-                ret = data.get("ret", 0)
-                errcode = data.get("errcode", 0)
-                if ret == 0 and (errcode == 0 or errcode is None):
-                    self.logger.warning(
-                        "WeChat send text succeeded WITHOUT context_token for {}; "
-                        "clearing expired token from cache",
-                        to_user_id,
-                    )
-                    self._context_tokens.pop(to_user_id, None)
-                    self._save_state()
-                    self.logger.debug(
-                        "WeChat text sent to {} (client_id={})", to_user_id, client_id
-                    )
-                    return
-            # Treat persistent ret=-2 as non-fatal (matching reference plugin).
+        # The iLink sendmessage API may return ret=-2 / errcode=-2 for two
+        # different reasons:
+        #   - stale context_token: errmsg is empty/None or "unknown error"
+        #   - genuine rate limit:  errmsg is populated (e.g. "frequency limit")
+        # Per hermes-agent#17228 / #18100, the empty/None variant is a stale
+        # session signal.  Retry once without context_token (iLink accepts
+        # tokenless sends as a degraded fallback).  If the tokenless attempt
+        # also fails, let _check_response_error raise so ChannelManager can
+        # retry with backoff — do NOT swallow the error.
+        if _is_stale_session_ret(ret, errcode, errmsg) and context_token:
             self.logger.warning(
-                "WeChat send text returned ret=-2 for {} (client_id={}); "
-                "treating as non-fatal. Request body: {}. Response: {}",
+                "WeChat send text returned stale-session signal for {} (client_id={}); "
+                "retrying without context_token",
                 to_user_id,
                 client_id,
-                json.dumps(body, ensure_ascii=False, default=str),
-                json.dumps(data, ensure_ascii=False, default=str),
             )
-            self.logger.debug("WeChat text sent to {} (client_id={})", to_user_id, client_id)
-            return
+            body_no_ctx = copy.deepcopy(body)
+            body_no_ctx["msg"].pop("context_token", None)
+            data = await self._api_post("ilink/bot/sendmessage", body_no_ctx)
+            ret = data.get("ret", 0)
+            errcode = data.get("errcode", 0)
+            errmsg = data.get("errmsg", "")
+            if ret == 0 and (errcode == 0 or errcode is None):
+                self.logger.warning(
+                    "WeChat send text succeeded WITHOUT context_token for {}; "
+                    "clearing expired token from cache",
+                    to_user_id,
+                )
+                self._context_tokens.pop(to_user_id, None)
+                self._save_state()
+                self.logger.debug(
+                    "WeChat text sent to {} (client_id={})", to_user_id, client_id
+                )
+                return
 
         self._check_response_error(data, "send text", body=body)
         self.logger.debug("WeChat text sent to {} (client_id={})", to_user_id, client_id)
@@ -1341,14 +1364,33 @@ class WeixinChannel(BaseChannel):
 
         data = await self._api_post("ilink/bot/sendmessage", body)
         ret = data.get("ret", 0)
-        if ret == -2:
-            # See _send_text for rationale: openclaw ignores ret on sendmessage.
+        errcode = data.get("errcode", 0)
+        errmsg = data.get("errmsg", "")
+
+        # Same stale-session handling as _send_text (hermes-agent#17228 / #18100).
+        if _is_stale_session_ret(ret, errcode, errmsg) and context_token:
             self.logger.warning(
-                "WeChat send media returned ret=-2 for {} (client_id={}); treating as non-fatal",
+                "WeChat send media returned stale-session signal for {} (client_id={}); "
+                "retrying without context_token",
                 to_user_id,
                 client_id,
             )
-            return
+            body_no_ctx = copy.deepcopy(body)
+            body_no_ctx["msg"].pop("context_token", None)
+            data = await self._api_post("ilink/bot/sendmessage", body_no_ctx)
+            ret = data.get("ret", 0)
+            errcode = data.get("errcode", 0)
+            errmsg = data.get("errmsg", "")
+            if ret == 0 and (errcode == 0 or errcode is None):
+                self.logger.warning(
+                    "WeChat send media succeeded WITHOUT context_token for {}; "
+                    "clearing expired token from cache",
+                    to_user_id,
+                )
+                self._context_tokens.pop(to_user_id, None)
+                self._save_state()
+                return
+
         self._check_response_error(data, "send media", body=body)
 
 
