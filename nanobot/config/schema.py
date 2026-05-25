@@ -59,6 +59,10 @@ class DreamConfig(Base):
     # on — set to False to feed all memory files raw if a specific LLM reacts
     # poorly to the `← Nd` suffix or you want deterministic, git-independent prompts.
     annotate_line_ages: bool = True
+    # When False (default), Dream may only modify skills it created (marked
+    # dream_managed in frontmatter). When True, Dream may also edit user-created
+    # workspace skills. Builtin skills are never editable.
+    dream_edit_user_skills: bool = False
 
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""

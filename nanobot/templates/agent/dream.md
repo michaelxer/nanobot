@@ -45,9 +45,16 @@ Flag [SKILL] only when ALL are true: repeatable workflow appeared 2+ times, invo
 
 For [SKILL] entries:
 - Use write_file to create skills/<name>/SKILL.md; read_file `{{ skill_creator_path }}` for format reference
-- YAML frontmatter (name, description), under 2000 words: when to use, steps, output format, example
+- YAML frontmatter must include name, description, **and `dream_managed: true`** (marks this skill as Dream-created)
+- Under 2000 words: when to use, steps, output format, example
 - Do NOT overwrite existing skills — if overlapping, merge delta into the existing skill
 - Skills are instruction sets, not code. Keep concrete values in MEMORY.md; skills use placeholders
+
+## Skill edit policy
+Each skill in the Existing Skills list is tagged with an origin:
+- **[dream]** — Dream-created (has `dream_managed: true` in frontmatter). You MAY edit these.
+- **[user]** — User-created workspace skill. {% if dream_edit_user_skills %}You MAY edit these.{% else %}You MUST NOT modify, rename, or delete these — you can only read them for context.{% endif %}
+- **[builtin]** — Bundled with nanobot. You MUST NEVER modify these.
 
 ## Editing
 - Default tool: apply_patch. Use edit_file only for small exact replacements.

@@ -986,6 +986,7 @@ class Dream:
         max_iterations: int = 10,
         max_tool_result_chars: int = 16_000,
         annotate_line_ages: bool = True,
+        edit_user_skills: bool = False,
     ):
         self.store = store
         self.provider = provider
@@ -997,6 +998,9 @@ class Dream:
         # Default True keeps the #3212 behavior; set False to feed all memory
         # files raw (e.g. if a specific LLM reacts poorly to the `← Nd` suffix).
         self.annotate_line_ages = annotate_line_ages
+        # When True, Dream may edit/delete user-created workspace skills.
+        # When False, only skills with dream_managed: true in frontmatter are editable.
+        self.edit_user_skills = edit_user_skills
         self._runner = AgentRunner(provider)
         self._tools = self._build_tools()
 
@@ -1038,15 +1042,25 @@ class Dream:
 
     # -- skill listing --------------------------------------------------------
 
-    def _list_existing_skills(self) -> list[str]:
-        """List existing skills as 'name — description' for dedup context."""
+    def _list_existing_skills(self, tag_origin: bool = False) -> list[str]:
+        """List existing skills as 'name — description [origin]' for dedup context.
+
+        When *tag_origin* is True each entry gets an origin tag:
+        ``[dream]`` for skills with ``dream_managed: true`` in frontmatter,
+        ``[user]`` for other workspace skills, ``[builtin]`` for bundled skills.
+        """
         import re as _re
 
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 
         desc_re = _re.compile(r"^description:\s*(.+)$", _re.MULTILINE | _re.IGNORECASE)
-        entries: dict[str, str] = {}
-        for base in (self.store.workspace / "skills", BUILTIN_SKILLS_DIR):
+        managed_re = _re.compile(r"^dream_managed:\s*true$", _re.MULTILINE | _re.IGNORECASE)
+
+        entries: dict[str, tuple[str, str]] = {}  # name -> (desc, tag)
+        builtin_dir = BUILTIN_SKILLS_DIR
+        ws_skills_dir = self.store.workspace / "skills"
+
+        for base in (ws_skills_dir, builtin_dir):
             if not base.exists():
                 continue
             for d in base.iterdir():
@@ -1056,13 +1070,26 @@ class Dream:
                 if not skill_md.exists():
                     continue
                 # Prefer workspace skills over builtin (same name)
-                if d.name in entries and base == BUILTIN_SKILLS_DIR:
+                if d.name in entries and base == builtin_dir:
                     continue
                 content = skill_md.read_text(encoding="utf-8")[:500]
                 m = desc_re.search(content)
                 desc = m.group(1).strip() if m else "(no description)"
-                entries[d.name] = desc
-        return [f"{name} — {desc}" for name, desc in sorted(entries.items())]
+
+                if tag_origin:
+                    if base == builtin_dir:
+                        tag = "[builtin]"
+                    elif managed_re.search(content):
+                        tag = "[dream]"
+                    else:
+                        tag = "[user]"
+                    entries[d.name] = (desc, tag)
+                else:
+                    entries[d.name] = (desc, "")
+
+        if tag_origin:
+            return [f"{name} — {desc}  {tag}" for name, (desc, tag) in sorted(entries.items())]
+        return [f"{name} — {desc}" for name, (desc, _) in sorted(entries.items())]
 
     # -- main entry ----------------------------------------------------------
 

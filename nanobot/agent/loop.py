@@ -1168,6 +1168,7 @@ class AgentLoop:
                 user_path=str(workspace / "USER.md"),
                 memory_path=str(workspace / "memory" / "MEMORY.md"),
                 stale_threshold_days=_STALE_THRESHOLD_DAYS,
+                dream_edit_user_skills=self.dream.edit_user_skills,
             )
             session.metadata["_dream_system_prompt"] = cached_prompt
             session.metadata["_dream_system_prompt_mtime"] = current_mtime
@@ -1220,7 +1221,7 @@ class AgentLoop:
                 f"## Current USER.md ({len(current_user)} chars)\n{current_user}"
             )
 
-            existing_skills = self.dream._list_existing_skills()
+            existing_skills = self.dream._list_existing_skills(tag_origin=True)
             skills_section = ""
             if existing_skills:
                 skills_section = (
