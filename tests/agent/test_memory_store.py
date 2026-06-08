@@ -268,6 +268,57 @@ class TestDreamCursor:
         store2 = MemoryStore(store.workspace)
         assert store2.get_last_dream_cursor() == 3
 
+    def test_get_current_cursor_returns_zero_when_empty(self, store):
+        assert store.get_current_cursor() == 0
+
+    def test_get_current_cursor_returns_latest_history_cursor(self, store):
+        c1 = store.append_history("msg 1")
+        c2 = store.append_history("msg 2")
+        assert store.get_current_cursor() == c2
+        assert c2 > c1
+
+    def test_get_current_cursor_reflects_written_cursor_file(self, store):
+        # Simulate a cursor file written by append_history
+        store.append_history("msg 1")
+        store.append_history("msg 2")
+        assert store.get_current_cursor() == 2
+
+    def test_dream_disabled_advancing_cursor_prevents_history_injection(self, store):
+        """When Dream is disabled, advancing the dream cursor to the current
+        cursor prevents read_unprocessed_history from returning all entries."""
+        # Simulate some history entries
+        store.append_history("msg 1")
+        store.append_history("msg 2")
+        store.append_history("msg 3")
+
+        # Before advancing: all entries are unprocessed
+        unprocessed = store.read_unprocessed_history(
+            since_cursor=store.get_last_dream_cursor()
+        )
+        assert len(unprocessed) == 3
+
+        # Simulate the fix: advance dream cursor to current cursor
+        store.set_last_dream_cursor(store.get_current_cursor())
+
+        # After advancing: no entries are unprocessed
+        unprocessed = store.read_unprocessed_history(
+            since_cursor=store.get_last_dream_cursor()
+        )
+        assert len(unprocessed) == 0
+
+    def test_dream_disabled_new_entries_still_appear_after_cursor_advance(self, store):
+        """After advancing the dream cursor, new entries should still appear
+        as unprocessed."""
+        store.append_history("old msg")
+        store.set_last_dream_cursor(store.get_current_cursor())
+
+        store.append_history("new msg")
+        unprocessed = store.read_unprocessed_history(
+            since_cursor=store.get_last_dream_cursor()
+        )
+        assert len(unprocessed) == 1
+        assert unprocessed[0]["content"] == "new msg"
+
     def test_git_restore_rolls_back_dream_cursor(self, tmp_path):
         store = MemoryStore(tmp_path)
         store.write_memory("before")

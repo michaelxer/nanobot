@@ -304,6 +304,17 @@ class MemoryStore:
                 poisoned,
             )
 
+    def get_current_cursor(self) -> int:
+        """Return the most recently assigned history cursor, or 0 if none."""
+        if self._cursor_file.exists():
+            with suppress(ValueError, OSError):
+                return int(self._cursor_file.read_text(encoding="utf-8").strip())
+        last = self._read_last_entry() or {}
+        cursor = self._valid_cursor(last.get("cursor"))
+        if cursor is not None:
+            return cursor
+        return max((c for _, c in self._iter_valid_entries()), default=0)
+
     def _next_cursor(self) -> int:
         """Read the current cursor counter and return the next value."""
         if self._cursor_file.exists():
