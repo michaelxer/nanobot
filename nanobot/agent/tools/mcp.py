@@ -675,13 +675,15 @@ async def connect_mcp_servers(
                 )
                 _sh_cm = streamable_http_client(cfg.url, http_client=http_client)
                 read, write, _ = await server_stack.enter_async_context(_sh_cm)
-                # Track the underlying async generator so _close_server can explicitly
-                # aclose() it if stack.aclose() fails with a cross-task
-                # cancel-scope RuntimeError.  See #4302.
-                # streamable_http_client() returns an _AsyncGeneratorContextManager
-                # whose real async generator lives at .gen; use that directly.
-                server_stack._tracked_async_generators = [  # type: ignore[attr-defined]
-                    getattr(_sh_cm, "gen", _sh_cm)
+                # Track the context manager so _close_server can call __aexit__()
+                # if stack.aclose() fails with a cross-task cancel-scope
+                # RuntimeError.  See #4302.
+                # streamable_http_client() returns an
+                # _AsyncGeneratorContextManager; __aexit__() drives its finally
+                # block (including anyio task-group teardown), which gen.aclose()
+                # alone may not fully unwind.
+                server_stack._tracked_context_managers = [  # type: ignore[attr-defined]
+                    _sh_cm
                 ]
             else:
                 logger.warning("MCP server '{}': unknown transport type '{}'", name, transport_type)
@@ -1139,12 +1141,19 @@ async def _close_server(state: Any, server_name: str) -> None:
         #
         # See https://github.com/HKUDS/nanobot/issues/4302
         logger.debug("MCP server '{}' cleanup error (can be ignored)", server_name)
-        for gen in getattr(stack, "_tracked_async_generators", []):
-            # If the stored object is an async context manager (e.g.
-            # _AsyncGeneratorContextManager from MCP SDK), unwrap to the
-            # underlying generator which actually has aclose().
-            actual = getattr(gen, "gen", gen)
+        for cm in getattr(stack, "_tracked_context_managers", []):
+            # Use __aexit__ to properly drive the context manager's finally
+            # block.  For MCP SDK's streamable_http_client this unwinds the
+            # anyio task group and closes the underlying async generator;
+            # gen.aclose() alone may not fully unwind the anyio cancel scope.
             try:
-                await actual.aclose()
+                await cm.__aexit__(None, None, None)
             except Exception:
-                pass
+                # As a last resort, try aclose() on the underlying generator
+                # so it is not left for GC finalization.
+                gen = getattr(cm, "gen", None)
+                if gen is not None:
+                    try:
+                        await gen.aclose()
+                    except Exception:
+                        pass

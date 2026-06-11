@@ -400,28 +400,29 @@ async def test_concurrent_mcp_reconnect_reuses_fresh_session(
 
 
 @pytest.mark.asyncio
-async def test_close_server_cleans_up_tracked_generators_on_error():
+async def test_close_server_cleans_up_tracked_context_managers_on_error():
     """When stack.aclose() raises RuntimeError (anyio cancel scope exit from a
-    different task), _close_server must explicitly aclose() tracked async
-    generators to prevent GC finalization from crashing the process.
+    different task), _close_server must __aexit__() tracked context managers
+    to prevent GC finalization from crashing the process.
 
     Uses a real @asynccontextmanager to match the object shape returned by
-    MCP SDK's streamable_http_client(), which stores the underlying async
-    generator at .gen.
+    MCP SDK's streamable_http_client().  __aexit__() drives the finally block
+    (including anyio task-group teardown), which gen.aclose() alone may not
+    fully unwind.
 
     Regression test for https://github.com/HKUDS/nanobot/issues/4302
     """
 
-    closed_generators: list[str] = []
+    closed_via_exit: list[str] = []
 
     @asynccontextmanager
     async def _fake_streamable_http_client():
         """Simulates streamable_http_client() which returns an
-        _AsyncGeneratorContextManager with the real generator at .gen."""
+        _AsyncGeneratorContextManager."""
         try:
             yield ("read", "write")
         finally:
-            closed_generators.append("streamable_http")
+            closed_via_exit.append("streamable_http")
 
     cm = _fake_streamable_http_client()
     # Enter the context manager so it's in a half-open state, just like
@@ -440,9 +441,9 @@ async def test_close_server_cleans_up_tracked_generators_on_error():
 
     stack = _BrokenStack()
     await stack.__aenter__()
-    # Simulate what connect_mcp_servers does: attach the context manager
-    # (not yet unwrapped).  _close_server must unwrap via getattr(cm, "gen", cm).
-    stack._tracked_async_generators = [cm]
+    # Simulate what connect_mcp_servers does: store the context manager.
+    # _close_server calls __aexit__() on it for proper cleanup.
+    stack._tracked_context_managers = [cm]
 
     state = SimpleNamespace(_mcp_stacks={"test": stack})
 
@@ -452,5 +453,5 @@ async def test_close_server_cleans_up_tracked_generators_on_error():
     # Server removed from state.
     assert "test" not in state._mcp_stacks
 
-    # The underlying async generator was explicitly closed via .gen.aclose().
-    assert closed_generators == ["streamable_http"]
+    # The context manager's finally block ran via __aexit__().
+    assert closed_via_exit == ["streamable_http"]
