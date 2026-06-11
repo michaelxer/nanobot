@@ -673,9 +673,14 @@ async def connect_mcp_servers(
                         timeout=None,
                     )
                 )
-                read, write, _ = await server_stack.enter_async_context(
-                    streamable_http_client(cfg.url, http_client=http_client)
-                )
+                _sh_cm = streamable_http_client(cfg.url, http_client=http_client)
+                read, write, _ = await server_stack.enter_async_context(_sh_cm)
+                # Track the context manager so _close_server can explicitly
+                # aclose() it if stack.aclose() fails with a cross-task
+                # cancel-scope RuntimeError.  See #4302.
+                server_stack._tracked_async_generators = [  # type: ignore[attr-defined]
+                    _sh_cm
+                ]
             else:
                 logger.warning("MCP server '{}': unknown transport type '{}'", name, transport_type)
                 await server_stack.aclose()
@@ -1119,4 +1124,21 @@ async def _close_server(state: Any, server_name: str) -> None:
     try:
         await stack.aclose()
     except (RuntimeError, BaseExceptionGroup):
+        # The MCP SDK's streamable_http_client uses anyio.create_task_group()
+        # internally.  When _close_server runs in a different asyncio task than
+        # the one that opened the connection, the anyio cancel-scope exit raises
+        # RuntimeError ("Attempted to exit cancel scope in a different task").
+        #
+        # stack.aclose() catches and re-raises, but the underlying async
+        # generator is left in a half-closed state.  If we don't explicitly
+        # close it now, Python's GC will attempt finalization later -- and
+        # *that* finalizer runs in the event-loop callback context where the
+        # error cannot be properly handled, crashing the entire process.
+        #
+        # See https://github.com/HKUDS/nanobot/issues/4302
         logger.debug("MCP server '{}' cleanup error (can be ignored)", server_name)
+        for gen in getattr(stack, "_tracked_async_generators", []):
+            try:
+                await gen.aclose()
+            except Exception:
+                pass

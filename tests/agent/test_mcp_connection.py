@@ -397,3 +397,52 @@ async def test_concurrent_mcp_reconnect_reuses_fresh_session(
     assert outputs == ["fresh:alpha", "fresh:beta"]
     assert connect_count == 2
     assert closed == ["remote"]
+
+
+@pytest.mark.asyncio
+async def test_close_server_cleans_up_tracked_generators_on_error():
+    """When stack.aclose() raises RuntimeError (anyio cancel scope exit from a
+    different task), _close_server must explicitly aclose() tracked async
+    generators to prevent GC finalization from crashing the process.
+
+    Regression test for https://github.com/HKUDS/nanobot/issues/4302
+    """
+
+    closed_generators: list[str] = []
+
+    class _FakeAsyncGen:
+        """Simulates streamable_http_client async generator."""
+
+        def __init__(self, label: str):
+            self.label = label
+
+        async def aclose(self):
+            closed_generators.append(self.label)
+
+    gen = _FakeAsyncGen("streamable_http")
+
+    class _BrokenStack(AsyncExitStack):
+        """Stack whose aclose() raises RuntimeError, simulating the anyio
+        cancel scope exit across tasks."""
+
+        async def aclose(self):
+            raise RuntimeError(
+                "Attempted to exit cancel scope in a different task "
+                "than it was entered in"
+            )
+
+    stack = _BrokenStack()
+    await stack.__aenter__()
+    # Simulate what connect_mcp_servers does: attach tracked generators
+    stack._tracked_async_generators = [gen]
+
+    state = SimpleNamespace(_mcp_stacks={"test": stack})
+
+    # Should not raise -- the RuntimeError is caught internally.
+    await mcp_runtime._close_server(state, "test")
+
+    # Server removed from state.
+    assert "test" not in state._mcp_stacks
+
+    # The tracked async generator was explicitly closed.
+    assert closed_generators == ["streamable_http"]
