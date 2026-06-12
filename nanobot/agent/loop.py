@@ -1090,13 +1090,24 @@ class AgentLoop:
                 await stack.aclose()
             except (RuntimeError, BaseExceptionGroup):
                 logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
-                # Prevent GC from re-finalizing tracked generators, which would
-                # crash with "Attempted to exit cancel scope in a different task".
+                # stack.aclose() already called gen.aclose() internally via
+                # _AsyncGeneratorContextManager.__aexit__, which threw
+                # GeneratorExit into the generator.  The generator's finally
+                # block raised RuntimeError (anyio cancel scope cross-task).
+                #
+                # The generator is now half-closed: it received GeneratorExit
+                # but the finally block didn't complete.  If we try
+                # gen.aclose() again, it may succeed silently (generator
+                # already closing), so we would NOT add it to the prevention
+                # set.  But the generator is still not properly finalized,
+                # and Python's GC will attempt finalization later, crashing
+                # with the same cancel scope error.
+                #
+                # Fix: unconditionally add all tracked generators to the
+                # prevention set.  Do NOT call gen.aclose() again -- it was
+                # already attempted by stack.aclose().  #4302
                 for gen in getattr(stack, "_tracked_async_generators", []):
-                    try:
-                        await gen.aclose()
-                    except (RuntimeError, BaseExceptionGroup, Exception):
-                        _unclosed_mcp_generators.add(gen)
+                    _unclosed_mcp_generators.add(gen)
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""

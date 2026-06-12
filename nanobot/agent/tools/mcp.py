@@ -1147,13 +1147,11 @@ async def _close_server(state: Any, server_name: str) -> None:
         #
         # See https://github.com/HKUDS/nanobot/issues/4302
         logger.debug("MCP server '{}' cleanup error (can be ignored)", server_name)
+        # stack.aclose() already attempted gen.aclose() internally via
+        # _AsyncGeneratorContextManager.__aexit__.  The generator received
+        # GeneratorExit but its anyio cancel-scope cleanup failed.  Do NOT
+        # call gen.aclose() again (it may succeed silently, leaving the gen
+        # out of the prevention set).  Unconditionally add all tracked
+        # generators to prevent GC finalization crashes.  #4302
         for gen in getattr(stack, "_tracked_async_generators", []):
-            try:
-                await gen.aclose()
-            except (RuntimeError, BaseExceptionGroup):
-                # The generator's finally block runs anyio task-group teardown
-                # which hits the same cross-task cancel-scope error.
-                # Prevent GC from trying again by keeping a strong reference.
-                _unclosed_mcp_generators.add(gen)
-            except Exception:
-                _unclosed_mcp_generators.add(gen)
+            _unclosed_mcp_generators.add(gen)
