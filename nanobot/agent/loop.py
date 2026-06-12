@@ -1080,20 +1080,23 @@ class AgentLoop:
         # Lazy import to avoid circular dependency at module level.
         from nanobot.agent.tools.mcp import _unclosed_mcp_generators
 
-        for name, stack in self._mcp_stacks.items():
+        # Snapshot the dict: aclose() can trigger reconnect callbacks that
+        # mutate _mcp_stacks, causing "dictionary changed size during iteration".
+        # See https://github.com/HKUDS/nanobot/issues/4302
+        stacks_snapshot = list(self._mcp_stacks.items())
+        self._mcp_stacks.clear()
+        for name, stack in stacks_snapshot:
             try:
                 await stack.aclose()
             except (RuntimeError, BaseExceptionGroup):
                 logger.debug("MCP server '{}' cleanup error (can be ignored)", name)
                 # Prevent GC from re-finalizing tracked generators, which would
                 # crash with "Attempted to exit cancel scope in a different task".
-                # See https://github.com/HKUDS/nanobot/issues/4302
                 for gen in getattr(stack, "_tracked_async_generators", []):
                     try:
                         await gen.aclose()
                     except (RuntimeError, BaseExceptionGroup, Exception):
                         _unclosed_mcp_generators.add(gen)
-        self._mcp_stacks.clear()
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
