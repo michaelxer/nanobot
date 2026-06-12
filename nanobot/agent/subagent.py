@@ -380,6 +380,21 @@ class SubagentManager:
             await asyncio.gather(*tasks, return_exceptions=True)
         return len(tasks)
 
+    async def await_by_session(self, session_key: str) -> None:
+        """Wait for all subagent tasks spawned under *session_key* to finish.
+
+        This is used by cron jobs so that the job is not marked as completed
+        while background subagents are still running.
+        """
+        tids = set(self._session_tasks.get(session_key, set()))
+        tasks = [
+            self._running_tasks[tid]
+            for tid in tids
+            if tid in self._running_tasks and not self._running_tasks[tid].done()
+        ]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
         return len(self._running_tasks)

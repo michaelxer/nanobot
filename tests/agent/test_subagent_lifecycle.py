@@ -480,6 +480,58 @@ class TestCancelBySession:
 
 
 # ---------------------------------------------------------------------------
+# await_by_session
+# ---------------------------------------------------------------------------
+
+
+class TestAwaitBySession:
+    @pytest.mark.asyncio
+    async def test_waits_for_running_tasks(self, tmp_path):
+        sm = _manager(tmp_path)
+        done = asyncio.Event()
+        call_count = 0
+
+        async def _slow_run(spec):
+            nonlocal call_count
+            call_count += 1
+            await done.wait()
+            return AgentRunResult(final_content="done", messages=[], stop_reason="completed")
+        sm.runner.run = _slow_run
+
+        await sm.spawn("task1", session_key="s1")
+        await sm.spawn("task2", session_key="s1")
+
+        # Both tasks should be running (blocked on `done`)
+        assert sm.get_running_count_by_session("s1") == 2
+
+        # Release the tasks and wait
+        done.set()
+        await sm.await_by_session("s1")
+
+        assert call_count == 2
+        assert sm.get_running_count_by_session("s1") == 0
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_tasks(self, tmp_path):
+        sm = _manager(tmp_path)
+        # Should return immediately without error
+        await sm.await_by_session("nonexistent")
+
+    @pytest.mark.asyncio
+    async def test_already_done_returns_immediately(self, tmp_path):
+        sm = _manager(tmp_path)
+        sm.runner.run = AsyncMock(return_value=AgentRunResult(
+            final_content="done", messages=[], stop_reason="completed",
+        ))
+        await sm.spawn("task1", session_key="s1")
+        await _drain_subagent_tasks(sm)
+
+        # Should return immediately since task is already done
+        await sm.await_by_session("s1")
+        assert sm.get_running_count_by_session("s1") == 0
+
+
+# ---------------------------------------------------------------------------
 # get_running_count / get_running_count_by_session
 # ---------------------------------------------------------------------------
 

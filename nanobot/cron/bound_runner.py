@@ -19,6 +19,7 @@ from nanobot.utils.prompt_templates import render_template
 
 class BoundCronAgent(Protocol):
     tools: Any
+    subagents: Any
 
     async def submit_cron_turn(self, msg: InboundMessage) -> OutboundMessage | None:
         ...
@@ -138,6 +139,13 @@ async def run_bound_cron_job(
     finally:
         if isinstance(cron_tool, CronTool) and cron_token is not None:
             cron_tool.reset_cron_context(cron_token)
+
+    # Wait for any subagents spawned during this cron turn to finish
+    # before marking the job as completed.  Without this the cron service
+    # considers the job done while background subagents are still running,
+    # which causes their results to arrive after the cron run has already
+    # been recorded (see #4290).
+    await agent.subagents.await_by_session(session_key)
 
     response = resp.content if resp else ""
     cron.write_run_record(
